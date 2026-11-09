@@ -1,5 +1,6 @@
 local arguments = table.pack(...)
 local sharedEnv = getgenv and getgenv() or _G
+local currentJobId = tostring(game.JobId or '')
 local previous = rawget(sharedEnv, 'Gumball  -  discord.gg/projectgumball')
 
 -- Startup compatibility: only suppress duplicate execution when an actual
@@ -14,7 +15,8 @@ local function hasLiveGumballWindow()
     return ok and attached
 end
 if type(previous) == 'table' and previous.status == 'starting'
-    and not previous.stopped and os.clock() - (previous.started or 0) < 45 then
+    and previous.jobId == currentJobId
+    and not previous.stopped and os.clock() - (previous.started or 0) < 15 then
     return previous
 end
 if hasLiveGumballWindow() and
@@ -35,6 +37,7 @@ end
 local control = {
     status = 'starting',
     started = os.clock(),
+    jobId = currentJobId,
     error = nil,
     stopped = false,
 }
@@ -56,6 +59,12 @@ local teleportCleanupStarted = false
 local function cleanupForTeleport()
     if teleportCleanupStarted then return end
     teleportCleanupStarted = true
+    control.stopReason = 'teleport'
+    control.stopped = true
+
+    -- Restore the camera hook before UE removes the UI/controllers.
+    local disposeKnifeHook = rawget(sharedEnv, 'GM_KnifeBackstab')
+    if type(disposeKnifeHook) == 'function' then pcall(disposeKnifeHook) end
 
     if teleportConnection then
         teleportConnection:Disconnect()
@@ -81,9 +90,9 @@ local function cleanupForTeleport()
 end
 
 local function __step(id)
-    if control.stopped then
-        error('execution stopped', 0)
-    end
+    -- Cleanup is an expected lifecycle event.  Don't throw into every active
+    -- Roblox signal/callback after the UI unloads or a teleport starts.
+    if control.stopped then return end
 
     local thread = coroutine.running()
     local state = budgets[thread]
@@ -113,15 +122,20 @@ local function __step(id)
         state.frame = schedulerFrame
     end
     if state.ticks > 50000000 or now - state.started > 20 then
-        control.error = 'Execution made no progress: loop ' .. tostring(id)
-        control.status = 'error'
-        control.stopped = true
-
-        if heartbeatConnection then
-            heartbeatConnection:Disconnect()
+        local warningText = 'Long-running UE callback at loop ' .. tostring(id)
+        control.lastWatchdogWarning = warningText
+        -- A heavily loaded game/server can miss Heartbeats.  Reschedule this
+        -- one execution thread rather than permanently stopping every feature.
+        if coroutine.isyieldable() then
+            task.wait()
+            state.started = os.clock()
+            state.ticks = 0
+            state.frame = schedulerFrame
+            return
         end
-
-        error(control.error, 0)
+        -- An actually stuck non-yieldable handler fails on its own, without
+        -- marking the entire UE application as stopped.
+        error(warningText, 0)
     end
     if state.ticks > 0 and state.ticks % 262144 == 0 and coroutine.isyieldable() then
         task.wait()
@@ -134,7 +148,7 @@ local Native = {}
 local Backend = {}
 -- Reference to UE's native main window (captured as tabs are constructed).
 local gumballUEWindow
--- v11: The native Always Backstab slider controls ONLY the knife compatibility range.
+-- v12: The native Always Backstab slider controls ONLY the knife compatibility range.
 -- A value of zero deliberately disables the compatibility targeting loop.
 local gumballKnifeBackstabRange = 0
 
@@ -197,6 +211,7 @@ local function runApplication()
         control.error = result
         warn('[Gumball Startup] ' .. tostring(result))
         control.status = 'error'
+        control.stopReason = 'startup failure'
         control.stopped = true
 
         if heartbeatConnection then
@@ -245,6 +260,7 @@ local function runApplication()
                 teleportConnection = nil
             end
             control.status = 'unloaded'
+            control.stopReason = 'menu unloaded'
             control.stopped = true
 
             if heartbeatConnection then
@@ -2601,7 +2617,7 @@ function Native.toggle(captures)
 
         capture03:UpdateDependencyBoxes()
 
-        -- Gumball v11: attach directly after UE's original Always Backstab toggle.
+        -- Gumball v12: attach directly after UE's original Always Backstab toggle.
         -- A native dependency box hides the slider (and its spacing) when OFF.
         if capture05 == "exploits_always_backstab" then
             local okRange, errRange = pcall(function()
@@ -493860,7 +493876,7 @@ local function installGumballGlassShader()
     if not ok then warn("[Gumball Glass Shader] " .. tostring(err)) end
 end
 
--- Gumball v11: knife-only Always Backstab with a native 0-20 stud range slider.
+-- Gumball v12: knife-only Always Backstab + retry-safe startup and packet format.
 -- Adapted from the Kicia camera-angle approach; this does NOT trigger an attack.
 -- It only operates while UE's Always Backstab toggle is enabled and the actual
 -- equipped Rivals item is exactly "Knife", with a living enemy inside the chosen range.
@@ -493876,13 +493892,11 @@ local function installGumballKnifeBackstab()
         local controllers = playerScripts and playerScripts:FindFirstChild("Controllers")
         local controllerModule = controllers and controllers:FindFirstChild("FighterController")
         if not controllerModule or not controllerModule:IsA("ModuleScript") then
-            warn("[Gumball Backstab] FighterController is unavailable; original UE feature is unchanged.")
-            return
+            return false -- still loading; caller retries
         end
         local okController, fighterController = pcall(require, controllerModule)
         if not okController or type(fighterController) ~= "table" then
-            warn("[Gumball Backstab] FighterController could not be read; original UE feature is unchanged.")
-            return
+            return false -- module not ready yet; caller retries
         end
 
         local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -493890,8 +493904,7 @@ local function installGumballKnifeBackstab()
         local fighterRemotes = replication and replication:FindFirstChild("Fighter")
         local rotationRemote = fighterRemotes and fighterRemotes:FindFirstChild("UpdateCameraRotation")
         if not rotationRemote or not (rotationRemote:IsA("RemoteEvent") or rotationRemote:IsA("UnreliableRemoteEvent")) then
-            warn("[Gumball Backstab] Camera rotation remote unavailable; no changes applied.")
-            return
+            return false -- replication remotes still loading; caller retries
         end
 
         -- Read through UE's existing Linoria toggle; no new UI or separate config.
@@ -493969,7 +493982,7 @@ local function installGumballKnifeBackstab()
         -- this is an angle-replication modification, not a new attack method.
         local function encodeSingleDegrees(degrees)
             local turns = (math.rad(degrees) % (2 * math.pi)) / (2 * math.pi)
-            return utf8.char(math.clamp(math.floor(turns * 256 + 0.5), 0, 255))
+            return string.char(math.clamp(math.floor(turns * 256 + 0.5), 0, 255))
         end
         local function encodeFacing(rootPart)
             local pitch, yaw = rootPart.CFrame:ToOrientation()
@@ -494010,9 +494023,8 @@ local function installGumballKnifeBackstab()
                     if state.active then
                         -- Prevent normal camera replication from overwriting the
                         -- backstab-facing packet until knife is unequipped.
-                        pcall(function() fighterController._replication_stopped = false end)
                         local prior = fighterController._last_encoded_camera_rotation
-                        if type(prior) == "string" then return prior end
+                        if type(prior) == "string" and #prior == 2 then return prior end
                     end
                     return originalEncode(originalUtility, rawRotation)
                 end,
@@ -494056,22 +494068,37 @@ local function installGumballKnifeBackstab()
         end
         sharedEnv.GM_KnifeBackstab = dispose
 
+        local lastHeartbeatWarning = 0
         heartbeatConnection = RunService.Heartbeat:Connect(function()
             if control.stopped or state.disposed then dispose(); return end
-            if not enabledInUE() or gumballKnifeBackstabRange <= 0 then
+            local okTick, errTick = pcall(function()
+                if not enabledInUE() or gumballKnifeBackstabRange <= 0 then
+                    state.active = false
+                    return
+                end
+                local now = os.clock()
+                if now - state.lastSend < 0.08 then return end
+                state.lastSend = now
+                if not equippedKnife() then state.active = false; return end
+                local target = findEnemyRoot()
+                if not target then state.active = false; return end
+                local packedRotation = encodeFacing(target)
+                if type(packedRotation) ~= "string" or #packedRotation ~= 2 then
+                    state.active = false
+                    return
+                end
+                state.active = true
+                -- Only automatic rotation replication, never an attack event.
+                rotationRemote:FireServer(packedRotation, nil)
+            end)
+            if not okTick then
                 state.active = false
-                return
+                local now = os.clock()
+                if now - lastHeartbeatWarning >= 10 then
+                    lastHeartbeatWarning = now
+                    warn("[Gumball Backstab] Rotation update skipped: " .. tostring(errTick))
+                end
             end
-            local now = os.clock()
-            if now - state.lastSend < 0.08 then return end
-            state.lastSend = now
-            if not equippedKnife() then state.active = false; return end
-            local target = findEnemyRoot()
-            if not target then state.active = false; return end
-            state.active = true
-            -- Never swing, activate a gun, or alter hit damage. This sends only
-            -- the knife backstab-facing angles used by the Kicia reference.
-            pcall(function() rotationRemote:FireServer(encodeFacing(target), nil) end)
         end)
 
         teleportConnection = player.OnTeleport:Connect(function(status)
@@ -494083,13 +494110,29 @@ local function installGumballKnifeBackstab()
         if type(library) == "table" and typeof(library.ScreenGui) == "Instance" then
             menuConnection = library.ScreenGui.Destroying:Connect(dispose)
         end
+        return true
     end)
-    if not success then warn("[Gumball Backstab] " .. tostring(failure)) end
+    if not success then
+        if not control.stopped then warn("[Gumball Backstab] " .. tostring(failure)) end
+        return false
+    end
+    return failure == true
 end
 
 local gumballResult = runApplication()
 if gumballResult and gumballResult.status ~= "error" then
-    task.defer(installGumballKnifeBackstab)
+    task.defer(function()
+        -- Auto-execute on teleport may run before FighterController or remotes
+        -- exist. Retry until ready; install at most one camera hook/heartbeat.
+        for attempt = 1, 20 do
+            if control.stopped then return end
+            if installGumballKnifeBackstab() then return end
+            task.wait(attempt <= 5 and 1 or 3)
+        end
+        if not control.stopped then
+            warn('[Gumball Backstab] Startup retry limit reached; native UE toggle remains available.')
+        end
+    end)
     task.defer(function()
         -- The VM may finish constructing its menu after the entry point returns.
         for _ = 1, 80 do
