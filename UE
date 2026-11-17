@@ -122,11 +122,7 @@ do
     end)
 end
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("       Project - Gumball")
-print("Discord: https://discord.gg/projectgumball")
-print("Owner Social: https://haunt.gg/gu9mball")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
 local existingBase64Decode = base64_decode
 
 local function fallbackBase64Decode(encoded)
@@ -66008,4 +66004,3 @@ local function directEntry(...)
 end
 
 return directEntry(...)
-
